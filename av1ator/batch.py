@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -91,6 +92,10 @@ def output_path(src: Path, in_root: Path, out_root: Path) -> Path:
     return out_root / src.relative_to(in_root).with_suffix(".mkv")
 
 
+def passthrough_path(src: Path, in_root: Path, out_root: Path) -> Path:
+    return out_root / src.relative_to(in_root)
+
+
 def partial_path(dst: Path) -> Path:
     return dst.with_name(f"{dst.stem}.part{dst.suffix}")
 
@@ -131,6 +136,33 @@ def _encode(
         _State.proc = None
 
 
+def _passthrough(src: Path, dst: Path, delete_input: bool) -> bool:
+    """Copy (or move, when delete_input) src to dst without re-encoding,
+    using a .part staging file so an interrupted transfer is retried on
+    the next scan. Returns True on success."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    partial = partial_path(dst)
+    action = "moving" if delete_input else "copying"
+    print(f"{action} {src} -> {dst}", file=sys.stderr)
+    try:
+        shutil.copy2(src, partial)
+    except OSError as e:
+        print(f"warning: could not copy {src}: {e}", file=sys.stderr)
+        if partial.exists():
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+        return False
+    partial.rename(dst)
+    if delete_input:
+        try:
+            src.unlink()
+        except OSError as e:
+            print(f"warning: could not delete {src}: {e}", file=sys.stderr)
+    return True
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Watch a directory and batch-encode video to AV1.",
@@ -167,6 +199,14 @@ def main() -> int:
         "--skip-codec", action="append", default=None, metavar="CODEC",
         help="skip files with this video codec (e.g. av1); repeatable",
     )
+    filters.add_argument(
+        "--passthrough-filtered", action="store_true",
+        help=(
+            "copy filtered-out files to the output dir unchanged (preserving "
+            "their original extension) instead of ignoring them; combine with "
+            "--delete-input to move rather than copy"
+        ),
+    )
 
     args = p.parse_args()
     args.skip_codec = {c.lower() for c in (args.skip_codec or [])}
@@ -195,15 +235,21 @@ def main() -> int:
             if src in skipped:
                 continue
             dst = output_path(src, args.input_dir, args.output_dir)
-            if dst.exists():
+            pass_dst = passthrough_path(src, args.input_dir, args.output_dir)
+            if dst.exists() or pass_dst.exists():
                 continue
 
+            def _handle_filtered(reason: str) -> None:
+                if args.passthrough_filtered:
+                    print(f"passthrough {src}: {reason}", file=sys.stderr)
+                    if not _passthrough(src, pass_dst, args.delete_input):
+                        skipped.add(src)
+                else:
+                    print(f"skip {src}: {reason}", file=sys.stderr)
+                    skipped.add(src)
+
             if args.min_size is not None and current[src] < args.min_size:
-                print(
-                    f"skip {src}: size {current[src]} < {args.min_size}",
-                    file=sys.stderr,
-                )
-                skipped.add(src)
+                _handle_filtered(f"size {current[src]} < {args.min_size}")
                 continue
 
             try:
@@ -214,8 +260,7 @@ def main() -> int:
 
             reason = _filter_reason(args, info)
             if reason is not None:
-                print(f"skip {src}: {reason}", file=sys.stderr)
-                skipped.add(src)
+                _handle_filtered(reason)
                 continue
 
             dst.parent.mkdir(parents=True, exist_ok=True)
