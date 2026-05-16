@@ -20,7 +20,7 @@ from av1ator.encode import (
     svt_params,
 )
 from av1ator.hdr import hdr10_svt_params
-from av1ator.probe import first_frame_side_data, probe
+from av1ator.probe import first_frame_side_data, nice_preexec, probe
 from av1ator.sidedata import merge_side_data
 
 
@@ -52,6 +52,10 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="print the ffmpeg command and exit",
     )
+    p.add_argument(
+        "--nice", type=int, default=None, metavar="N",
+        help="run ffprobe/ffmpeg with nice increment N (lower priority)",
+    )
     args = p.parse_args()
 
     if not args.input.is_file():
@@ -63,14 +67,14 @@ def main() -> int:
     ffmpeg = require("ffmpeg")
     ffprobe = require("ffprobe")
 
-    info = probe(ffprobe, args.input)
+    info = probe(ffprobe, args.input, nice=args.nice)
     streams = info.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
     if video is None:
         sys.exit("error: no video stream found in input")
 
     side_data = merge_side_data(
-        video, first_frame_side_data(ffprobe, args.input),
+        video, first_frame_side_data(ffprobe, args.input, nice=args.nice),
     )
     video_params = svt_params(video, side_data, args.preset, args.crf)
 
@@ -91,4 +95,6 @@ def main() -> int:
         print(" ".join(shlex.quote(a) for a in ffmpeg_cmd))
         return 0
 
-    return subprocess.run(ffmpeg_cmd).returncode
+    return subprocess.run(
+        ffmpeg_cmd, preexec_fn=nice_preexec(args.nice),
+    ).returncode

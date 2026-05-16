@@ -26,7 +26,7 @@ from av1ator.encode import (
     svt_params,
 )
 from av1ator.hdr import hdr10_svt_params
-from av1ator.probe import first_frame_side_data, probe
+from av1ator.probe import first_frame_side_data, nice_preexec, probe
 from av1ator.sidedata import merge_side_data
 
 DEFAULT_INTERVAL = 30
@@ -113,13 +113,15 @@ def _handle_signal(signum, frame):
 
 def _encode(
     ffmpeg: str, ffprobe: str, src: Path, dst: Path, info: dict,
-    crf: int, preset: int,
+    crf: int, preset: int, nice: int | None = None,
 ) -> int | None:
     """Return ffmpeg's rc, or None if the command cannot be built."""
     video = next(
         s for s in info.get("streams", []) if s.get("codec_type") == "video"
     )
-    side_data = merge_side_data(video, first_frame_side_data(ffprobe, src))
+    side_data = merge_side_data(
+        video, first_frame_side_data(ffprobe, src, nice=nice),
+    )
     video_params = svt_params(video, side_data, preset, crf)
     if hdr10_svt_params(side_data):
         print(f"hdr10: {src}", file=sys.stderr)
@@ -129,7 +131,7 @@ def _encode(
         print(f"error: {src}: {e}", file=sys.stderr)
         return None
 
-    _State.proc = subprocess.Popen(cmd)
+    _State.proc = subprocess.Popen(cmd, preexec_fn=nice_preexec(nice))
     try:
         return _State.proc.wait()
     finally:
@@ -178,6 +180,10 @@ def main() -> int:
     p.add_argument(
         "--delete-input", action="store_true",
         help="delete source file after a successful encode",
+    )
+    p.add_argument(
+        "--nice", type=int, default=None, metavar="N",
+        help="run ffprobe/ffmpeg with nice increment N (lower priority)",
     )
 
     filters = p.add_argument_group(
@@ -253,7 +259,7 @@ def main() -> int:
                 continue
 
             try:
-                info = probe(ffprobe, src)
+                info = probe(ffprobe, src, nice=args.nice)
             except subprocess.CalledProcessError:
                 skipped.add(src)
                 continue
@@ -268,6 +274,7 @@ def main() -> int:
             print(f"encoding {src} -> {dst}", file=sys.stderr)
             rc = _encode(
                 ffmpeg, ffprobe, src, partial, info, args.crf, args.preset,
+                nice=args.nice,
             )
 
             if rc is None:
