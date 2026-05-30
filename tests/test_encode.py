@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from av1ator.encode import (
+    DEFAULT_FILM_GRAIN,
     DEFAULT_KEYINT,
     DEFAULT_TUNE,
     DEFAULT_VARIANCE_BOOST_STRENGTH,
@@ -24,7 +25,7 @@ def test_svt_cli_to_ffmpeg_params_rejects_odd_args():
 
 
 def test_svt_params_includes_defaults_and_user_values():
-    result = svt_params({}, [], preset=6, crf=28)
+    result = svt_params({}, [], preset=6, crf=28, film_grain=8)
     assert result == [
         "--tune", str(DEFAULT_TUNE),
         "--keyint", DEFAULT_KEYINT,
@@ -33,12 +34,20 @@ def test_svt_params_includes_defaults_and_user_values():
         "--crf", "28",
         "--enable-variance-boost", "1",
         "--variance-boost-strength", str(DEFAULT_VARIANCE_BOOST_STRENGTH),
+        "--film-grain", "8",
+        "--film-grain-denoise", "0",
     ]
+
+
+def test_svt_params_film_grain_defaults_to_constant():
+    result = svt_params({}, [], preset=6, crf=28, film_grain=DEFAULT_FILM_GRAIN)
+    idx = result.index("--film-grain")
+    assert result[idx + 1] == str(DEFAULT_FILM_GRAIN)
 
 
 def test_svt_params_appends_colour_and_hdr():
     video = {"color_primaries": "bt709"}
-    result = svt_params(video, [], preset=6, crf=28)
+    result = svt_params(video, [], preset=6, crf=28, film_grain=8)
     assert "--color-primaries" in result
     assert "1" in result
 

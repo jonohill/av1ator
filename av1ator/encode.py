@@ -13,6 +13,7 @@ DEFAULT_PRESET = 7
 DEFAULT_TUNE = 2
 DEFAULT_KEYINT = "10s"
 DEFAULT_VARIANCE_BOOST_STRENGTH = 2
+DEFAULT_FILM_GRAIN = 8
 
 
 def svt_params(
@@ -20,6 +21,7 @@ def svt_params(
     side_data: list[dict],
     preset: int,
     crf: int,
+    film_grain: int,
 ) -> list[str]:
     params = [
         "--tune",
@@ -36,6 +38,10 @@ def svt_params(
         "1",
         "--variance-boost-strength",
         str(DEFAULT_VARIANCE_BOOST_STRENGTH),
+        "--film-grain",
+        str(film_grain),
+        "--film-grain-denoise",
+        "0",
     ]
     params += colour_svt_params(video)
     params += hdr10_svt_params(side_data)

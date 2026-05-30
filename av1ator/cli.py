@@ -15,6 +15,7 @@ from pathlib import Path
 
 from av1ator.encode import (
     DEFAULT_CRF,
+    DEFAULT_FILM_GRAIN,
     DEFAULT_PRESET,
     build_ffmpeg_cmd,
     svt_params,
@@ -49,6 +50,13 @@ def main() -> int:
         help=f"0 (slowest/best) to 13 (fastest), default {DEFAULT_PRESET}",
     )
     p.add_argument(
+        "--film-grain", type=int, default=DEFAULT_FILM_GRAIN, metavar="N",
+        help=(
+            f"synthesised film grain, 0-50 (0 = off; dithers away banding in "
+            f"dark/smooth scenes at ~no bitrate cost, default {DEFAULT_FILM_GRAIN})"
+        ),
+    )
+    p.add_argument(
         "--dry-run", action="store_true",
         help="print the ffmpeg command and exit",
     )
@@ -76,7 +84,9 @@ def main() -> int:
     side_data = merge_side_data(
         video, first_frame_side_data(ffprobe, args.input, nice=args.nice),
     )
-    video_params = svt_params(video, side_data, args.preset, args.crf)
+    video_params = svt_params(
+        video, side_data, args.preset, args.crf, args.film_grain,
+    )
 
     if hdr10_svt_params(side_data):
         print(
