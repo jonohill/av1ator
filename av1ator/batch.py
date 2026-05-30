@@ -21,6 +21,7 @@ from pathlib import Path
 from av1ator.cli import require
 from av1ator.encode import (
     DEFAULT_CRF,
+    DEFAULT_FILM_GRAIN,
     DEFAULT_PRESET,
     build_ffmpeg_cmd,
     svt_params,
@@ -113,7 +114,7 @@ def _handle_signal(signum, frame):
 
 def _encode(
     ffmpeg: str, ffprobe: str, src: Path, dst: Path, info: dict,
-    crf: int, preset: int, nice: int | None = None,
+    crf: int, preset: int, film_grain: int, nice: int | None = None,
 ) -> int | None:
     """Return ffmpeg's rc, or None if the command cannot be built."""
     video = next(
@@ -122,7 +123,7 @@ def _encode(
     side_data = merge_side_data(
         video, first_frame_side_data(ffprobe, src, nice=nice),
     )
-    video_params = svt_params(video, side_data, preset, crf)
+    video_params = svt_params(video, side_data, preset, crf, film_grain)
     if hdr10_svt_params(side_data):
         print(f"hdr10: {src}", file=sys.stderr)
     try:
@@ -173,6 +174,13 @@ def main() -> int:
     p.add_argument("output_dir", type=Path)
     p.add_argument("--crf", type=int, default=DEFAULT_CRF)
     p.add_argument("--preset", type=int, default=DEFAULT_PRESET)
+    p.add_argument(
+        "--film-grain", type=int, default=DEFAULT_FILM_GRAIN, metavar="N",
+        help=(
+            f"synthesised film grain, 0-50 (0 = off; dithers away banding in "
+            f"dark/smooth scenes at ~no bitrate cost, default {DEFAULT_FILM_GRAIN})"
+        ),
+    )
     p.add_argument(
         "--interval", type=int, default=DEFAULT_INTERVAL,
         help=f"poll interval in seconds (default {DEFAULT_INTERVAL})",
@@ -274,7 +282,7 @@ def main() -> int:
             print(f"encoding {src} -> {dst}", file=sys.stderr)
             rc = _encode(
                 ffmpeg, ffprobe, src, partial, info, args.crf, args.preset,
-                nice=args.nice,
+                args.film_grain, nice=args.nice,
             )
 
             if rc is None:
