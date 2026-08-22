@@ -1,4 +1,4 @@
-FROM mwader/static-ffmpeg:8.1.2 AS ffmpeg
+FROM mwader/static-ffmpeg:9.0.1 AS ffmpeg
 
 FROM python:3.14-alpine
 
