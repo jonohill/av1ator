@@ -77,18 +77,31 @@ def _filter_reason(args: argparse.Namespace, info: dict) -> str | None:
     return None
 
 
-def scan(root: Path) -> dict[Path, int]:
+def scan(
+    root: Path, extensions: frozenset[str] = VIDEO_EXTENSIONS,
+) -> dict[Path, int]:
     sizes: dict[Path, int] = {}
     for dirpath, _, filenames in os.walk(root):
         for name in filenames:
             p = Path(dirpath) / name
-            if p.suffix.lower() not in VIDEO_EXTENSIONS:
+            if p.suffix.lower() not in extensions:
                 continue
             try:
                 sizes[p] = p.stat().st_size
             except OSError:
                 continue
     return sizes
+
+
+def sidecar_owner(sidecar: Path, videos: Iterable[Path]) -> Path | None:
+    """Return the video in sidecar's directory whose stem, followed by '.',
+    starts sidecar's name (Name.mkv owns Name.eng.srt), or None if there is
+    none. When several videos match, the longest stem wins."""
+    matches = [
+        v for v in videos
+        if v.parent == sidecar.parent and sidecar.name.startswith(f"{v.stem}.")
+    ]
+    return max(matches, key=lambda v: len(v.stem), default=None)
 
 
 def output_path(src: Path, in_root: Path, out_root: Path) -> Path:
@@ -321,6 +334,13 @@ def main() -> int:
         "--status-dir", type=Path, default=None, metavar="DIR",
         help="maintain DIR/status.json with the current job and skipped files",
     )
+    p.add_argument(
+        "--sidecar-ext", action="append", default=None, metavar="EXT",
+        help=(
+            "carry files with this extension (e.g. srt) that share a video's "
+            "name prefix to the output dir alongside it; repeatable"
+        ),
+    )
 
     filters = p.add_argument_group(
         "input filters", "skip source files that match these criteria",
@@ -352,6 +372,11 @@ def main() -> int:
 
     args = p.parse_args()
     args.skip_codec = {c.lower() for c in (args.skip_codec or [])}
+    sidecar_exts = frozenset(
+        f".{e.lower().lstrip('.')}" for e in (args.sidecar_ext or [])
+    )
+    if sidecar_exts & VIDEO_EXTENSIONS:
+        p.error("--sidecar-ext cannot be a video extension")
 
     if not args.input_dir.is_dir():
         sys.exit(f"error: input dir not found: {args.input_dir}")
@@ -374,13 +399,37 @@ def main() -> int:
     def skip(src: Path, reason: str) -> None:
         skipped[src] = (reason, time.time())
 
+    def move_sidecars(sidecars: Iterable[Path]) -> None:
+        for sidecar in sidecars:
+            if sidecar in skipped:
+                continue
+            dst = passthrough_path(sidecar, args.input_dir, args.output_dir)
+            if dst.exists():
+                continue
+            try:
+                _passthrough(sidecar, dst, args.delete_input)
+            except OSError as e:
+                print(
+                    f"warning: could not copy {sidecar}: {e}", file=sys.stderr,
+                )
+                skip(sidecar, f"could not copy: {e}")
+
     while not _State.stop:
         status.write()
-        current = scan(args.input_dir)
+        current = scan(args.input_dir, VIDEO_EXTENSIONS | sidecar_exts)
         stable = sorted(p for p, s in current.items() if prev.get(p) == s)
         prev = current
 
+        videos = [p for p in current if p.suffix.lower() in VIDEO_EXTENSIONS]
+        owners = {
+            p: sidecar_owner(p, videos)
+            for p in stable if p.suffix.lower() in sidecar_exts
+        }
+        move_sidecars(p for p, owner in owners.items() if owner is None)
+
         for src in stable:
+            if src.suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
             if _State.stop:
                 break
             if src in skipped:
@@ -406,6 +455,8 @@ def main() -> int:
                         f"warning: could not copy {src}: {e}", file=sys.stderr,
                     )
                     skip(src, f"could not copy: {e}")
+                else:
+                    move_sidecars(p for p, v in owners.items() if v == src)
                 finally:
                     status.idle()
 
@@ -455,6 +506,7 @@ def main() -> int:
                             f"warning: could not delete {src}: {e}",
                             file=sys.stderr,
                         )
+                move_sidecars(p for p, v in owners.items() if v == src)
             else:
                 if partial.exists():
                     partial.unlink()

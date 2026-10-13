@@ -1,7 +1,14 @@
 import json
 from pathlib import Path
 
-from av1ator.batch import StatusFile, progress_blocks, progress_fields
+from av1ator.batch import (
+    VIDEO_EXTENSIONS,
+    StatusFile,
+    progress_blocks,
+    progress_fields,
+    scan,
+    sidecar_owner,
+)
 
 PROGRESS_OUTPUT = """\
 frame=0
@@ -155,3 +162,48 @@ def test_status_disabled_writes_nothing(tmp_path):
     status.progress({"fps": 1.0})
     status.idle()
     assert list(tmp_path.iterdir()) == []
+
+
+D = Path("/in/Movies/Name (2020)")
+
+
+def test_sidecar_owner_matches_stem():
+    video = D / "Name (2020).mkv"
+    assert sidecar_owner(D / "Name (2020).srt", [video]) == video
+    assert sidecar_owner(D / "Name (2020).eng.srt", [video]) == video
+
+
+def test_sidecar_owner_matches_extra_dots():
+    video = D / "Name (2020).mkv"
+    assert sidecar_owner(D / "Name (2020).en.forced.srt", [video]) == video
+    dotted = D / "Show.S01E01.720p.mkv"
+    assert sidecar_owner(D / "Show.S01E01.720p.eng.srt", [dotted]) == dotted
+
+
+def test_sidecar_owner_requires_dot_after_stem():
+    video = D / "Name.mkv"
+    assert sidecar_owner(D / "Name2.eng.srt", [video]) is None
+    assert sidecar_owner(D / "Name - extra.srt", [video]) is None
+
+
+def test_sidecar_owner_prefers_longest_stem():
+    short, long = D / "Name.mkv", D / "Name.Part2.mkv"
+    assert sidecar_owner(D / "Name.Part2.eng.srt", [short, long]) == long
+    assert sidecar_owner(D / "Name.eng.srt", [short, long]) == short
+
+
+def test_sidecar_owner_orphan_when_no_video_in_directory():
+    assert sidecar_owner(D / "Name.eng.srt", []) is None
+    elsewhere = Path("/in/Movies/Other/Name.mkv")
+    assert sidecar_owner(D / "Name.eng.srt", [elsewhere]) is None
+
+
+def test_scan_includes_extra_extensions(tmp_path):
+    (tmp_path / "a.mkv").write_bytes(b"x")
+    (tmp_path / "a.eng.SRT").write_bytes(b"xy")
+    (tmp_path / "a.nfo").write_bytes(b"xyz")
+    assert scan(tmp_path) == {tmp_path / "a.mkv": 1}
+    assert scan(tmp_path, VIDEO_EXTENSIONS | {".srt"}) == {
+        tmp_path / "a.mkv": 1,
+        tmp_path / "a.eng.SRT": 2,
+    }
