@@ -9,6 +9,7 @@ is implicit and survives restarts without a state file."""
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 from av1ator.cli import require
@@ -75,18 +77,31 @@ def _filter_reason(args: argparse.Namespace, info: dict) -> str | None:
     return None
 
 
-def scan(root: Path) -> dict[Path, int]:
+def scan(
+    root: Path, extensions: frozenset[str] = VIDEO_EXTENSIONS,
+) -> dict[Path, int]:
     sizes: dict[Path, int] = {}
     for dirpath, _, filenames in os.walk(root):
         for name in filenames:
             p = Path(dirpath) / name
-            if p.suffix.lower() not in VIDEO_EXTENSIONS:
+            if p.suffix.lower() not in extensions:
                 continue
             try:
                 sizes[p] = p.stat().st_size
             except OSError:
                 continue
     return sizes
+
+
+def sidecar_owner(sidecar: Path, videos: Iterable[Path]) -> Path | None:
+    """Return the video in sidecar's directory whose stem, followed by '.',
+    starts sidecar's name (Name.mkv owns Name.eng.srt), or None if there is
+    none. When several videos match, the longest stem wins."""
+    matches = [
+        v for v in videos
+        if v.parent == sidecar.parent and sidecar.name.startswith(f"{v.stem}.")
+    ]
+    return max(matches, key=lambda v: len(v.stem), default=None)
 
 
 def output_path(src: Path, in_root: Path, out_root: Path) -> Path:
@@ -99,6 +114,120 @@ def passthrough_path(src: Path, in_root: Path, out_root: Path) -> Path:
 
 def partial_path(dst: Path) -> Path:
     return dst.with_name(f"{dst.stem}.part{dst.suffix}")
+
+
+def progress_blocks(lines: Iterable[str]) -> Iterator[dict[str, str]]:
+    """Yield each key=value block of ffmpeg's -progress output."""
+    block: dict[str, str] = {}
+    for line in lines:
+        key, sep, value = line.strip().partition("=")
+        if not sep:
+            continue
+        block[key] = value.strip()
+        if key == "progress":
+            yield block
+            block = {}
+
+
+def _number(value: str | None, convert: Callable[[str], float]):
+    if value is None:
+        return None
+    try:
+        return convert(value)
+    except ValueError:
+        return None
+
+
+def progress_fields(block: dict[str, str]) -> dict:
+    """Map an ffmpeg progress block to status fields, omitting any that
+    ffmpeg reported as N/A."""
+    out_time_us = _number(block.get("out_time_us"), int)
+    speed = block.get("speed")
+    fields = {
+        "position_seconds": None if out_time_us is None else out_time_us / 1e6,
+        "fps": _number(block.get("fps"), float),
+        "speed": _number(speed.removesuffix("x") if speed else None, float),
+        "output_bytes": _number(block.get("total_size"), int),
+    }
+    return {k: v for k, v in fields.items() if v is not None}
+
+
+def _duration(info: dict | None) -> float | None:
+    if info is None:
+        return None
+    return _number((info.get("format") or {}).get("duration"), float)
+
+
+class StatusFile:
+    """Maintains status_dir/status.json for an external monitor. Every
+    method is a no-op when status_dir is None.
+
+    skipped is shared with the caller, which adds to it as files are given
+    up on."""
+
+    def __init__(
+        self, status_dir: Path | None, in_root: Path, out_root: Path,
+        skipped: dict[Path, tuple[str, float]],
+    ):
+        self.path = None if status_dir is None else status_dir / "status.json"
+        self.in_root = in_root
+        self.out_root = out_root
+        self.skipped = skipped
+        self.current: dict | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.path is not None
+
+    def start(
+        self, action: str, src: Path, dst: Path, input_bytes: int,
+        info: dict | None = None,
+    ) -> None:
+        current = {
+            "action": action,
+            "src": src.relative_to(self.in_root).as_posix(),
+            "dst": dst.relative_to(self.out_root).as_posix(),
+            "input_bytes": input_bytes,
+        }
+        duration = _duration(info)
+        if duration is not None:
+            current["duration_seconds"] = duration
+        current["started_at"] = time.time()
+        self.current = current
+        self.write()
+
+    def progress(self, fields: dict) -> None:
+        if self.current is not None:
+            self.current.update(fields)
+        self.write()
+
+    def idle(self) -> None:
+        self.current = None
+        self.write()
+
+    def write(self) -> None:
+        if self.path is None:
+            return
+        doc = {
+            "updated_at": time.time(),
+            "current": self.current,
+            "skipped": [
+                {
+                    "src": src.relative_to(self.in_root).as_posix(),
+                    "reason": reason,
+                    "at": at,
+                }
+                for src, (reason, at) in self.skipped.items()
+            ],
+        }
+        tmp = self.path.with_name(f"{self.path.name}.tmp")
+        try:
+            tmp.write_text(json.dumps(doc))
+            os.replace(tmp, self.path)
+        except OSError as e:
+            print(
+                f"warning: could not write {self.path}: {e}", file=sys.stderr,
+            )
 
 
 class _State:
@@ -115,8 +244,12 @@ def _handle_signal(signum, frame):
 def _encode(
     ffmpeg: str, ffprobe: str, src: Path, dst: Path, info: dict,
     crf: int, preset: int, film_grain: int, nice: int | None = None,
-) -> int | None:
-    """Return ffmpeg's rc, or None if the command cannot be built."""
+    on_progress: Callable[[dict], None] | None = None,
+) -> int:
+    """Return ffmpeg's rc. Raises ValueError if the command cannot be built.
+
+    on_progress, if given, receives the progress_fields of each progress
+    report ffmpeg emits."""
     video = next(
         s for s in info.get("streams", []) if s.get("codec_type") == "video"
     )
@@ -126,44 +259,48 @@ def _encode(
     video_params = svt_params(video, side_data, preset, crf, film_grain)
     if hdr10_svt_params(side_data):
         print(f"hdr10: {src}", file=sys.stderr)
-    try:
-        cmd = build_ffmpeg_cmd(ffmpeg, src, dst, info, video_params)
-    except ValueError as e:
-        print(f"error: {src}: {e}", file=sys.stderr)
-        return None
+    cmd = build_ffmpeg_cmd(ffmpeg, src, dst, info, video_params)
+    if on_progress is not None:
+        cmd[1:1] = ["-progress", "pipe:1", "-stats_period", "5"]
 
-    _State.proc = subprocess.Popen(cmd, preexec_fn=nice_preexec(nice))
+    _State.proc = subprocess.Popen(
+        cmd,
+        stdout=None if on_progress is None else subprocess.PIPE,
+        text=True,
+        preexec_fn=nice_preexec(nice),
+    )
     try:
+        if on_progress is not None:
+            for block in progress_blocks(_State.proc.stdout):
+                on_progress(progress_fields(block))
         return _State.proc.wait()
     finally:
         _State.proc = None
 
 
-def _passthrough(src: Path, dst: Path, delete_input: bool) -> bool:
+def _passthrough(src: Path, dst: Path, delete_input: bool) -> None:
     """Copy (or move, when delete_input) src to dst without re-encoding,
     using a .part staging file so an interrupted transfer is retried on
-    the next scan. Returns True on success."""
+    the next scan. Raises OSError if the copy fails."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     partial = partial_path(dst)
     action = "moving" if delete_input else "copying"
     print(f"{action} {src} -> {dst}", file=sys.stderr)
     try:
         shutil.copy2(src, partial)
-    except OSError as e:
-        print(f"warning: could not copy {src}: {e}", file=sys.stderr)
+    except OSError:
         if partial.exists():
             try:
                 partial.unlink()
             except OSError:
                 pass
-        return False
+        raise
     partial.rename(dst)
     if delete_input:
         try:
             src.unlink()
         except OSError as e:
             print(f"warning: could not delete {src}: {e}", file=sys.stderr)
-    return True
 
 
 def main() -> int:
@@ -192,6 +329,17 @@ def main() -> int:
     p.add_argument(
         "--nice", type=int, default=None, metavar="N",
         help="run ffprobe/ffmpeg with nice increment N (lower priority)",
+    )
+    p.add_argument(
+        "--status-dir", type=Path, default=None, metavar="DIR",
+        help="maintain DIR/status.json with the current job and skipped files",
+    )
+    p.add_argument(
+        "--sidecar-ext", action="append", default=None, metavar="EXT",
+        help=(
+            "carry files with this extension (e.g. srt) that share a video's "
+            "name prefix to the output dir alongside it; repeatable"
+        ),
     )
 
     filters = p.add_argument_group(
@@ -224,10 +372,17 @@ def main() -> int:
 
     args = p.parse_args()
     args.skip_codec = {c.lower() for c in (args.skip_codec or [])}
+    sidecar_exts = frozenset(
+        f".{e.lower().lstrip('.')}" for e in (args.sidecar_ext or [])
+    )
+    if sidecar_exts & VIDEO_EXTENSIONS:
+        p.error("--sidecar-ext cannot be a video extension")
 
     if not args.input_dir.is_dir():
         sys.exit(f"error: input dir not found: {args.input_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.status_dir is not None:
+        args.status_dir.mkdir(parents=True, exist_ok=True)
 
     ffmpeg = require("ffmpeg")
     ffprobe = require("ffprobe")
@@ -235,15 +390,46 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    skipped: set[Path] = set()
+    skipped: dict[Path, tuple[str, float]] = {}
+    status = StatusFile(
+        args.status_dir, args.input_dir, args.output_dir, skipped,
+    )
     prev: dict[Path, int] = {}
 
+    def skip(src: Path, reason: str) -> None:
+        skipped[src] = (reason, time.time())
+
+    def move_sidecars(sidecars: Iterable[Path]) -> None:
+        for sidecar in sidecars:
+            if sidecar in skipped:
+                continue
+            dst = passthrough_path(sidecar, args.input_dir, args.output_dir)
+            if dst.exists():
+                continue
+            try:
+                _passthrough(sidecar, dst, args.delete_input)
+            except OSError as e:
+                print(
+                    f"warning: could not copy {sidecar}: {e}", file=sys.stderr,
+                )
+                skip(sidecar, f"could not copy: {e}")
+
     while not _State.stop:
-        current = scan(args.input_dir)
+        status.write()
+        current = scan(args.input_dir, VIDEO_EXTENSIONS | sidecar_exts)
         stable = sorted(p for p, s in current.items() if prev.get(p) == s)
         prev = current
 
+        videos = [p for p in current if p.suffix.lower() in VIDEO_EXTENSIONS]
+        owners = {
+            p: sidecar_owner(p, videos)
+            for p in stable if p.suffix.lower() in sidecar_exts
+        }
+        move_sidecars(p for p, owner in owners.items() if owner is None)
+
         for src in stable:
+            if src.suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
             if _State.stop:
                 break
             if src in skipped:
@@ -253,14 +439,26 @@ def main() -> int:
             if dst.exists() or pass_dst.exists():
                 continue
 
-            def _handle_filtered(reason: str) -> None:
-                if args.passthrough_filtered:
-                    print(f"passthrough {src}: {reason}", file=sys.stderr)
-                    if not _passthrough(src, pass_dst, args.delete_input):
-                        skipped.add(src)
-                else:
+            def _handle_filtered(
+                reason: str, info: dict | None = None,
+            ) -> None:
+                if not args.passthrough_filtered:
                     print(f"skip {src}: {reason}", file=sys.stderr)
-                    skipped.add(src)
+                    skip(src, reason)
+                    return
+                print(f"passthrough {src}: {reason}", file=sys.stderr)
+                status.start("passthrough", src, pass_dst, current[src], info)
+                try:
+                    _passthrough(src, pass_dst, args.delete_input)
+                except OSError as e:
+                    print(
+                        f"warning: could not copy {src}: {e}", file=sys.stderr,
+                    )
+                    skip(src, f"could not copy: {e}")
+                else:
+                    move_sidecars(p for p, v in owners.items() if v == src)
+                finally:
+                    status.idle()
 
             if args.min_size is not None and current[src] < args.min_size:
                 _handle_filtered(f"size {current[src]} < {args.min_size}")
@@ -268,28 +466,36 @@ def main() -> int:
 
             try:
                 info = probe(ffprobe, src, nice=args.nice)
-            except subprocess.CalledProcessError:
-                skipped.add(src)
+            except subprocess.CalledProcessError as e:
+                reason = f"ffprobe rc={e.returncode}"
+                print(f"skip {src}: {reason}", file=sys.stderr)
+                skip(src, reason)
                 continue
 
             reason = _filter_reason(args, info)
             if reason is not None:
-                _handle_filtered(reason)
+                _handle_filtered(reason, info)
                 continue
 
             dst.parent.mkdir(parents=True, exist_ok=True)
             partial = partial_path(dst)
             print(f"encoding {src} -> {dst}", file=sys.stderr)
-            rc = _encode(
-                ffmpeg, ffprobe, src, partial, info, args.crf, args.preset,
-                args.film_grain, nice=args.nice,
-            )
-
-            if rc is None:
-                skipped.add(src)
+            status.start("encode", src, dst, current[src], info)
+            try:
+                rc = _encode(
+                    ffmpeg, ffprobe, src, partial, info, args.crf, args.preset,
+                    args.film_grain, nice=args.nice,
+                    on_progress=status.progress if status.enabled else None,
+                )
+            except ValueError as e:
+                print(f"error: {src}: {e}", file=sys.stderr)
+                skip(src, str(e))
                 if partial.exists():
                     partial.unlink()
                 continue
+            finally:
+                status.idle()
+
             if rc == 0:
                 partial.rename(dst)
                 if args.delete_input:
@@ -300,13 +506,14 @@ def main() -> int:
                             f"warning: could not delete {src}: {e}",
                             file=sys.stderr,
                         )
+                move_sidecars(p for p, v in owners.items() if v == src)
             else:
                 if partial.exists():
                     partial.unlink()
                 if _State.stop:
                     break
                 print(f"failed rc={rc}: {src}", file=sys.stderr)
-                skipped.add(src)
+                skip(src, f"ffmpeg rc={rc}")
 
         if _State.stop:
             break
@@ -315,6 +522,7 @@ def main() -> int:
                 break
             time.sleep(1)
 
+    status.idle()
     return 0
 
 
