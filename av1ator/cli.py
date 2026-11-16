@@ -2,17 +2,21 @@
 
 We probe the source for HDR10/colour metadata and audio layout, then run a
 single ffmpeg invocation that encodes video with libsvtav1, re-encodes (or
-copies) audio, and copies subtitles."""
+copies) audio, and copies subtitles. With --chunked, ffmpeg encodes the video
+into resumable segments and a second ffmpeg invocation joins them and muxes in
+the audio and subtitles."""
 
 from __future__ import annotations
 
 import argparse
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
+from av1ator import chunked
 from av1ator.encode import (
     DEFAULT_CRF,
     DEFAULT_FILM_GRAIN,
@@ -30,6 +34,72 @@ def require(tool: str) -> str:
     if not path:
         sys.exit(f"error: {tool!r} not found on PATH")
     return path
+
+
+def add_chunked_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--chunked", action="store_true",
+        help="encode video in resumable segments (requires --temp)",
+    )
+    p.add_argument(
+        "--segment-time", type=int, default=chunked.DEFAULT_SEGMENT_TIME,
+        metavar="SECONDS",
+        help=(
+            "--chunked segment length; a hard kill loses at most one segment "
+            f"(default {chunked.DEFAULT_SEGMENT_TIME})"
+        ),
+    )
+    p.add_argument(
+        "--temp", type=Path, default=None, metavar="DIR",
+        help=(
+            "--chunked work dir, kept on interruption so a rerun resumes; "
+            "use storage that survives a reboot"
+        ),
+    )
+
+
+def check_chunked_args(
+    p: argparse.ArgumentParser, args: argparse.Namespace,
+) -> None:
+    if args.chunked and args.temp is None:
+        p.error("--chunked requires --temp")
+    if args.segment_time <= 0:
+        p.error("--segment-time must be positive")
+
+
+def _forward_signal(signum, frame):
+    chunked.forward_signal(signum)
+
+
+def _run_chunked(
+    args: argparse.Namespace, ffmpeg: str, ffprobe: str, dst: Path,
+    info: dict, video_params: list[str], side_data: list[dict],
+) -> int:
+    try:
+        if args.dry_run:
+            cmds = [
+                chunked.segment_cmd(
+                    ffmpeg, ffprobe, args.input, info, video_params,
+                    args.temp, args.segment_time, nice=args.nice,
+                    side_data=side_data,
+                ),
+                chunked.mux_cmd(ffmpeg, args.input, dst, info, args.temp),
+            ]
+            for cmd in filter(None, cmds):
+                print(" ".join(shlex.quote(a) for a in cmd))
+            return 0
+
+        signal.signal(signal.SIGTERM, _forward_signal)
+        signal.signal(signal.SIGINT, _forward_signal)
+        result = chunked.encode_chunked(
+            ffmpeg, ffprobe, args.input, dst, info, video_params, args.temp,
+            args.segment_time, nice=args.nice, side_data=side_data,
+        )
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+    if result.tool is not None:
+        print(f"error: {result.tool} rc={result.rc}", file=sys.stderr)
+    return result.rc
 
 
 def main() -> int:
@@ -58,13 +128,15 @@ def main() -> int:
     )
     p.add_argument(
         "--dry-run", action="store_true",
-        help="print the ffmpeg command and exit",
+        help="print the command(s) and exit",
     )
     p.add_argument(
         "--nice", type=int, default=None, metavar="N",
         help="run ffprobe/ffmpeg with nice increment N (lower priority)",
     )
+    add_chunked_args(p)
     args = p.parse_args()
+    check_chunked_args(p, args)
 
     if not args.input.is_file():
         sys.exit(f"error: input not found: {args.input}")
@@ -94,9 +166,14 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    if args.chunked:
+        return _run_chunked(
+            args, ffmpeg, ffprobe, dst, info, video_params, side_data,
+        )
+
     try:
         ffmpeg_cmd = build_ffmpeg_cmd(
-            ffmpeg, args.input, dst, info, video_params,
+            ffmpeg, args.input, dst, info, video_params, side_data,
         )
     except ValueError as e:
         sys.exit(f"error: {e}")

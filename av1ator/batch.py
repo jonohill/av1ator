@@ -9,6 +9,7 @@ is implicit and survives restarts without a state file."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -20,7 +21,12 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
-from av1ator.cli import require
+from av1ator import chunked
+from av1ator.cli import (
+    add_chunked_args,
+    check_chunked_args,
+    require,
+)
 from av1ator.encode import (
     DEFAULT_CRF,
     DEFAULT_FILM_GRAIN,
@@ -114,6 +120,11 @@ def passthrough_path(src: Path, in_root: Path, out_root: Path) -> Path:
 
 def partial_path(dst: Path) -> Path:
     return dst.with_name(f"{dst.stem}.part{dst.suffix}")
+
+
+def chunked_temp(src: Path, in_root: Path, temp_root: Path) -> Path:
+    rel = src.relative_to(in_root).as_posix()
+    return temp_root / hashlib.sha256(rel.encode()).hexdigest()[:16]
 
 
 def progress_blocks(lines: Iterable[str]) -> Iterator[dict[str, str]]:
@@ -237,8 +248,25 @@ class _State:
 
 def _handle_signal(signum, frame):
     _State.stop = True
+    chunked.forward_signal(signum)
     if _State.proc is not None:
         _State.proc.terminate()
+
+
+def _video_params(
+    ffprobe: str, src: Path, info: dict, crf: int, preset: int,
+    film_grain: int, nice: int | None,
+) -> tuple[list[str], list[dict]]:
+    """The SVT-AV1 params and the merged side data they came from."""
+    video = next(
+        s for s in info.get("streams", []) if s.get("codec_type") == "video"
+    )
+    side_data = merge_side_data(
+        video, first_frame_side_data(ffprobe, src, nice=nice),
+    )
+    if hdr10_svt_params(side_data):
+        print(f"hdr10: {src}", file=sys.stderr)
+    return svt_params(video, side_data, preset, crf, film_grain), side_data
 
 
 def _encode(
@@ -250,16 +278,10 @@ def _encode(
 
     on_progress, if given, receives the progress_fields of each progress
     report ffmpeg emits."""
-    video = next(
-        s for s in info.get("streams", []) if s.get("codec_type") == "video"
+    video_params, side_data = _video_params(
+        ffprobe, src, info, crf, preset, film_grain, nice,
     )
-    side_data = merge_side_data(
-        video, first_frame_side_data(ffprobe, src, nice=nice),
-    )
-    video_params = svt_params(video, side_data, preset, crf, film_grain)
-    if hdr10_svt_params(side_data):
-        print(f"hdr10: {src}", file=sys.stderr)
-    cmd = build_ffmpeg_cmd(ffmpeg, src, dst, info, video_params)
+    cmd = build_ffmpeg_cmd(ffmpeg, src, dst, info, video_params, side_data)
     if on_progress is not None:
         cmd[1:1] = ["-progress", "pipe:1", "-stats_period", "5"]
 
@@ -370,7 +392,9 @@ def main() -> int:
         ),
     )
 
+    add_chunked_args(p)
     args = p.parse_args()
+    check_chunked_args(p, args)
     args.skip_codec = {c.lower() for c in (args.skip_codec or [])}
     sidecar_exts = frozenset(
         f".{e.lower().lstrip('.')}" for e in (args.sidecar_ext or [])
@@ -481,12 +505,25 @@ def main() -> int:
             partial = partial_path(dst)
             print(f"encoding {src} -> {dst}", file=sys.stderr)
             status.start("encode", src, dst, current[src], info)
+            failed_tool = "ffmpeg"
             try:
-                rc = _encode(
-                    ffmpeg, ffprobe, src, partial, info, args.crf, args.preset,
-                    args.film_grain, nice=args.nice,
-                    on_progress=status.progress if status.enabled else None,
-                )
+                if args.chunked:
+                    video_params, side_data = _video_params(
+                        ffprobe, src, info, args.crf, args.preset,
+                        args.film_grain, args.nice,
+                    )
+                    rc, failed_tool = chunked.encode_chunked(
+                        ffmpeg, ffprobe, src, partial, info, video_params,
+                        chunked_temp(src, args.input_dir, args.temp),
+                        args.segment_time, nice=args.nice,
+                        side_data=side_data,
+                    )
+                else:
+                    rc = _encode(
+                        ffmpeg, ffprobe, src, partial, info, args.crf,
+                        args.preset, args.film_grain, nice=args.nice,
+                        on_progress=status.progress if status.enabled else None,
+                    )
             except ValueError as e:
                 print(f"error: {src}: {e}", file=sys.stderr)
                 skip(src, str(e))
@@ -513,7 +550,7 @@ def main() -> int:
                 if _State.stop:
                     break
                 print(f"failed rc={rc}: {src}", file=sys.stderr)
-                skip(src, f"ffmpeg rc={rc}")
+                skip(src, f"{failed_tool} rc={rc}")
 
         if _State.stop:
             break
