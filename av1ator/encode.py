@@ -126,21 +126,20 @@ def build_segment_cmd(
     if src has no video stream or has Dolby Vision that can't be carried."""
     video, _ = _video_and_audio(info)
     cmd = [ffmpeg, "-hide_banner", "-y"]
-    filters = []
+    # Starting every run's timeline at its first frame makes segment list
+    # durations count frames and lets the concat demuxer join segments
+    # without gaps. build_mux_cmd restores the source's video start offset.
+    filters = "setpts=PTS-STARTPTS"
     if resume_at is not None:
         # Cutting with trim on the source's own timestamps avoids depending
-        # on which start time ffmpeg's seek and -ss count from. setpts
-        # restarts the run's timeline at the first frame, so segment list
-        # durations count frames.
+        # on which start time ffmpeg's seek and -ss count from.
         file_start = float(info.get("format", {}).get("start_time", 0))
         seek = max(0.0, resume_at - file_start - RESUME_PREROLL)
         cmd += ["-copyts", "-noaccurate_seek", "-ss", f"{seek:.6f}"]
-        filters = [
-            "-vf", f"trim=start={resume_at:.6f},setpts=PTS-STARTPTS",
-        ]
+        filters = f"trim=start={resume_at:.6f},{filters}"
     cmd += [
         "-i", str(src),
-        *filters,
+        "-vf", filters,
         *_video_args(video_params, side_data),
         *colour_mux_args(video),
         # Direct Matroska output defaults to vfr. The segment muxer defaults
@@ -165,19 +164,23 @@ def build_mux_cmd(
     info: dict,
 ) -> list[str]:
     """ffmpeg command that joins the segments named in concat_list and muxes
-    them with src's audio and subtitles. Raises ValueError if src has no
-    video stream."""
+    them with src's audio and subtitles, keeping src's video start offset and
+    video disposition. Raises ValueError if src has no video stream."""
     src_video, audio = _video_and_audio(info)
+    offset = _video_start_offset(info, src_video)
     cmd = [
         ffmpeg,
         "-hide_banner",
         "-y",
+        *(["-itsoffset", f"{offset:.6f}"] if offset > 0 else []),
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_list),
         "-i", str(src),
         "-map", "0:v:0",
         "-c:v", "copy",
+        # Segments lose the source's video disposition.
+        "-disposition:v:0", _disposition(src_video),
     ]
     for i in range(len(audio)):
         cmd += ["-map", f"1:a:{i}"]
@@ -186,3 +189,16 @@ def build_mux_cmd(
     cmd += colour_mux_args(src_video)
     cmd += [str(dst)]
     return cmd
+
+
+def _video_start_offset(info: dict, video: dict) -> float:
+    """Seconds by which src's video starts after its earliest stream."""
+    file_start = float(info.get("format", {}).get("start_time") or 0)
+    return float(video.get("start_time") or file_start) - file_start
+
+
+def _disposition(stream: dict) -> str:
+    if "disposition" not in stream:
+        return "default"
+    flags = [k for k, v in stream["disposition"].items() if v]
+    return "+".join(flags) or "0"

@@ -134,6 +134,7 @@ def test_build_segment_cmd():
     )
     assert cmd == [
         "ffmpeg", "-hide_banner", "-y", "-i", "/in/a.mkv",
+        "-vf", "setpts=PTS-STARTPTS",
         "-map", "0:v:0", "-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le",
         "-svtav1-params", "crf=30:tune=2",
         "-color_primaries", "bt709",
@@ -168,13 +169,34 @@ def test_build_mux_cmd():
         "ffmpeg", "-hide_banner", "-y",
         "-f", "concat", "-safe", "0", "-i", "/t/concat.txt",
         "-i", "/in/a.mkv",
-        "-map", "0:v:0", "-c:v", "copy",
+        "-map", "0:v:0", "-c:v", "copy", "-disposition:v:0", "default",
         "-map", "1:a:0",
         "-map", "1:s?", "-c:s", "copy",
         "-c:a", "libopus", "-b:a", "96k",
         "-color_primaries", "bt709",
         "/out/a.mkv",
     ]
+
+
+def test_build_mux_cmd_restores_video_start_offset():
+    info = {
+        **INFO,
+        "streams": [{**INFO["streams"][0], "start_time": "1.485000"}],
+        "format": {"start_time": "1.400000"},
+    }
+    cmd = build_mux_cmd("ffmpeg", Path("v"), Path("s"), Path("d"), info)
+    assert cmd[3:7] == ["-itsoffset", "0.085000", "-f", "concat"]
+
+
+def test_build_mux_cmd_copies_video_disposition():
+    video = {**INFO["streams"][0], "disposition": {"default": 0, "forced": 1}}
+    info = {**INFO, "streams": [video]}
+    cmd = build_mux_cmd("ffmpeg", Path("v"), Path("s"), Path("d"), info)
+    assert cmd[cmd.index("-disposition:v:0") + 1] == "forced"
+
+    video["disposition"] = {"default": 0}
+    cmd = build_mux_cmd("ffmpeg", Path("v"), Path("s"), Path("d"), info)
+    assert cmd[cmd.index("-disposition:v:0") + 1] == "0"
 
 
 def _audio_maps(cmd):
@@ -479,13 +501,75 @@ def _misaligned_frames(a: Path, b: Path, stats: Path) -> int:
     )
 
 
+def _video_pts(path: Path) -> list[float]:
+    out = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path),
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return sorted(float(line.rstrip(",")) for line in out.split())
+
+
+def _start(path: Path, stream: str) -> float:
+    return float(subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", stream,
+            "-show_entries", "stream=start_time", "-of", "csv=p=0", str(path),
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()[0])
+
+
+def _assert_same_timing(dst: Path, src: Path) -> None:
+    """dst's video has no timestamp gaps and starts as far after its audio
+    as src's does."""
+    pts = _video_pts(dst)
+    steps = [b - a for a, b in zip(pts, pts[1:])]
+    assert max(steps) - min(steps) < 0.002
+    delay = _start(dst, "v:0") - _start(dst, "a:0")
+    assert abs(delay - (_start(src, "v:0") - _start(src, "a:0"))) < 0.002
+
+
+def _delayed_video_source(src: Path, seconds: int, delay: float) -> None:
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-itsoffset", str(delay),
+            "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24000/1001",
+            "-f", "lavfi", "-i", "sine", "-t", str(seconds),
+            "-c:v", "libx264", "-g", "24", "-c:a", "aac", str(src),
+        ],
+        check=True,
+    )
+
+
 @pytest.mark.skipif(not _has_libsvtav1(), reason="needs ffmpeg with libsvtav1")
-@pytest.mark.parametrize("container, offset", [("mkv", 0), ("ts", 10)])
-def test_interrupted_encode_keeps_every_frame(tmp_path, container, offset):
+def test_delayed_video_keeps_timing_across_segments(tmp_path):
+    src = tmp_path / "src.mkv"
+    _delayed_video_source(src, 10, 0.1)
+    info = probe("ffprobe", src)
+    dst = tmp_path / "out.mkv"
+    result = encode_chunked(
+        "ffmpeg", "ffprobe", src, dst, info, ["--preset", "12", "--keyint", "1s"],
+        tmp_path / "temp", segment_time=2,
+    )
+    assert result == (0, None)
+    assert _frames(dst) == _frames(src)
+    _assert_same_timing(dst, src)
+
+
+@pytest.mark.skipif(not _has_libsvtav1(), reason="needs ffmpeg with libsvtav1")
+@pytest.mark.parametrize(
+    "container, offset, delay", [("mkv", 0, 0), ("ts", 10, 0), ("mkv", 0, 0.1)],
+)
+def test_interrupted_encode_keeps_every_frame(tmp_path, container, offset, delay):
     src = tmp_path / f"src.{container}"
     subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-itsoffset", str(delay),
             "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24000/1001",
             "-f", "lavfi", "-i", "sine", "-t", "45",
             "-c:v", "libx264", "-g", "24", "-bf", "2", "-c:a", "aac",
@@ -517,6 +601,7 @@ def test_interrupted_encode_keeps_every_frame(tmp_path, container, offset):
     assert result == (0, None)
     assert _frames(dst) == _frames(src)
     assert _misaligned_frames(dst, src, tmp_path / "psnr.log") == 0
+    _assert_same_timing(dst, src)
     assert not temp.exists()
 
 
